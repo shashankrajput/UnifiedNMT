@@ -27,10 +27,10 @@ class UnifiedNMTModel(object):
                  max_target_sequence_length,
                  num_units,
                  num_layers,
-                 source_window,
-                 source_attention_num_layers,
-                 source_attention_num_units,
-                 source_attention_activation,
+                 window,  ##### Maybe different windows for source and target
+                 attention_num_layers,  ##### Maybe different layers for source and target
+                 attention_num_units,
+                 attention_activation,
                  residual_connections,
                  projection_activation,
                  dropout,
@@ -125,8 +125,31 @@ class UnifiedNMTModel(object):
         # Feeds for inputs.
 
         # Our targets are decoder inputs shifted by one.
-        targets = [self.decoder_inputs[i + 1]
-                   for i in range(len(self.decoder_inputs) - 1)]
+        # targets = [self.decoder_inputs[i + 1]
+        #            for i in range(len(self.decoder_inputs) - 1)]
+
+
+        self.source_sentences = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_source_sequence_length],
+                                               name="source_sentences")
+        self.source_sentences_one_hot = tf.one_hot(self.source_sentences, self.source_vocab_size)
+
+        self.source_sentences_projected = tf.contrib.layers.fully_connected(self.source_sentences_one_hot,
+                                                                            self.num_units,
+                                                                            activation_fn=self.projection_activation)
+
+        self.target_sentences = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length],
+                                               name="target_sentences")
+        self.target_sentences_one_hot = tf.one_hot(self.target_sentences, self.target_vocab_size)
+
+        self.target_sentences_projected = tf.contrib.layers.fully_connected(self.target_sentences_one_hot,
+                                                                            self.num_units,
+                                                                            activation_fn=self.projection_activation)
+
+        self.sentence_contexts = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length,
+                                                                 self.num_units],
+                                                name="sentence_contexts")
+
+        create_static_RNN()
 
         # Training outputs and losses.
         if forward_only:
@@ -187,30 +210,32 @@ class UnifiedNMTModel(object):
             return tf.contrib.rnn.DropoutWrapper(self.create_multi_layered_cell())
         return self.create_multi_layered_cell()
 
-    def create_source_attention_network(self):
+    def create_attention_network(self, network_type, state):
+        if network_type == "source":
+            attention_network_input = self.source_sentences_projected
+        elif network_type == "target":
+            attention_network_input = self.target_sentences_projected
+        elif network_type == "context":
+            attention_network_input = self.sentence_contexts
+        else:
+            ######## Add error message
+            return
 
-        self.source_sentences = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_source_sequence_length],
-                                               name="source_sentences")
-        self.source_sentences_one_hot = tf.one_hot(self.source_sentences, self.source_vocab_size)
+        with tf.variable_scope(network_type):
+            ########## Add residual connections
 
-        self.source_sentences_projected = tf.contrib.layers.fully_connected(self.source_sentences_one_hot,
-                                                                            self.num_units,
-                                                                            activation_fn=self.projection_activation)
+            attention_scores = tf.contrib.layers.stack(attention_network_input + state,
+                                                       tf.contrib.layers.fully_connected,
+                                                       [
+                                                           self.attention_num_units] * self.attention_num_layers + [
+                                                           1],
+                                                       activation_fn=self.attention_activation)
 
-        ########## Add residual connections
+            attention_scores_squeezed = tf.squeeze(attention_scores)
 
-        self.source_attention_scores = tf.contrib.layers.stack(self.source_sentences_projected + self.state,
-                                                          tf.contrib.layers.fully_connected,
-                                                          [
-                                                              self.source_attention_num_units] * self.source_attention_num_layers + [
-                                                              1],
-                                                          activation_fn=self.source_attention_activation)
+            source_attention_values = tf.nn.softmax(attention_scores_squeezed)
 
-        self.source_attention_scores_squeezed = tf.squeeze(self.source_attention_scores)
-
-        self.source_attention_values = tf.nn.softmax(self.source_attention_scores_squeezed)
-
-        self.attention_weighted_source = self.source_sentences_projected * self.source_attention_values
+            return attention_scores_squeezed * source_attention_values
 
     ##################### tf.contrib.rnn.LSTMBlockWrapper
     ##################### Input and Output projection wrappers
@@ -218,16 +243,20 @@ class UnifiedNMTModel(object):
 
 
     def create_static_RNN(self):
+
         cell = self.create_dropout_cell()
         state = cell.zero_state(self.batch_size, self.dtype)
         outputs = []
 
         ######### Will this handle batches?
         for _ in range(self.steps):
+
+            attention_weighted_source = create_attention_network('source', state)
+            attention_weighted_target = create_attention_network('target', state)
+            attention_weighted_context = create_attention_network('context', state)
             output, state = cell(input_, state)
             outputs.append(output)
         return (outputs, state)
-
 
     ####################OVERRIDE GRUCELL TO PUT ATTENTION INSIDE?
 
