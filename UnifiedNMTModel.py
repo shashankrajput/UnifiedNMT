@@ -21,8 +21,6 @@ class UnifiedNMTModel(object):
     def __init__(self,
                  source_vocab_size,
                  target_vocab_size,
-                 source_embedding_size,
-                 target_embedding_size,
                  max_sequence_length,  ##### Maybe different max_sequence_length for source, context and target
                  num_units,
                  num_layers,
@@ -33,6 +31,7 @@ class UnifiedNMTModel(object):
                  residual_connections,
                  projection_activation,
                  dropout,
+                 positional_embedding_size,
                  steps,
                  max_gradient_norm,
                  batch_size,
@@ -68,8 +67,6 @@ class UnifiedNMTModel(object):
         """
         self.source_vocab_size = source_vocab_size
         self.target_vocab_size = target_vocab_size
-        self.source_embedding_size = source_embedding_size
-        self.target_embedding_size = target_embedding_size
         self.max_sequence_length = max_sequence_length
         self.num_units = num_units
         self.num_layers = num_layers
@@ -80,6 +77,7 @@ class UnifiedNMTModel(object):
         self.residual_connections = residual_connections
         self.projection_activation = projection_activation
         self.dropout = dropout
+        self.positional_embedding_size = positional_embedding_size
         self.steps = steps
         self.batch_size = batch_size
         self.learning_rate = tf.Variable(
@@ -135,15 +133,14 @@ class UnifiedNMTModel(object):
                                                                             self.num_units,
                                                                             activation_fn=self.projection_activation)
 
+        self.target_sentences_projected = tf.placeholder(tf.int32,
+                                                         shape=[self.batch_size, self.max_target_sequence_length,
+                                                                self.num_units],
+                                                         name="target_sentences")
 
-
-        self.target_sentences_projected = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length,
-                                                                 self.num_units],
-                                                name="target_sentences")
-
-        self.sentence_contexts = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length,
-                                                                 self.num_units],
-                                                name="sentence_contexts")
+        # self.sentence_contexts = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length,
+        #                                                         self.num_units],
+        #                                       name="sentence_contexts")
 
         create_static_RNN()
 
@@ -206,13 +203,13 @@ class UnifiedNMTModel(object):
             return tf.contrib.rnn.DropoutWrapper(self.create_multi_layered_cell())
         return self.create_multi_layered_cell()
 
-    def create_attention_network(self, network_type, state, network_reuse):
+    def create_attention_network(self, network_type, state, network_reuse, window):
         if network_type == "source":
             attention_network_input = self.source_sentences_projected
         elif network_type == "target":
             attention_network_input = self.target_sentences_projected
-        elif network_type == "context":
-            attention_network_input = self.sentence_contexts
+        #elif network_type == "context":
+        #    attention_network_input = self.sentence_contexts
         else:
             ######## Add error message
             return
@@ -226,25 +223,33 @@ class UnifiedNMTModel(object):
 
         local_reuse = False
 
-        for attention_network_input_i in attention_network_input_split:
-
-            ADD POSITIONAL EMBEDDINGS
+        for word_index, attention_network_input_i in enumerate(attention_network_input_split):
             fully_connected_reuse = local_reuse or network_reuse
 
-            attention_scores.append(tf.contrib.layers.stack(tf.concat([attention_network_input_i, state], 1),
-                                                            tf.contrib.layers.fully_connected,
-                                                            [
-                                                                self.attention_num_units] * self.attention_num_layers + [
-                                                                self.window],
-                                                            activation_fn=self.attention_activation, scope=network_type,
-                                                            reuse=fully_connected_reuse))
+            positional_embeddings = tf.get_variable("positional_embeddings",
+                                                    [self.max_sequence_length, self.positional_embedding_size],
+                                                    dtype=dtype, reuse=fully_connected_reuse)
+
+            embedding_lookup_indices = tf.multiply(tf.ones([self.batch_size], dtype=tf.int32, name='current_position'),
+                                                   word_index)
+
+            positional_embedding = tf.nn.embedding_lookup(positional_embeddings, embedding_lookup_indices)
+
+            attention_scores.append(
+                tf.contrib.layers.stack(tf.concat([attention_network_input_i, state, positional_embedding], 1),
+                                        tf.contrib.layers.fully_connected,
+                                        [
+                                            self.attention_num_units] * self.attention_num_layers + [
+                                            window],
+                                        activation_fn=self.attention_activation, scope=network_type,
+                                        reuse=fully_connected_reuse))
 
             local_reuse = True
 
         attention_scores_stacked = tf.stack(attention_scores, axis=1)
         attention_values = tf.nn.softmax(attention_scores_stacked, dim=1)
 
-        attention_values_split = tf.split(attention_values, num_or_size_splits=self.window, axis=-1)
+        attention_values_split = tf.split(attention_values, num_or_size_splits=window, axis=-1)
 
         attention_weighted_inputs = []
         for attention_values_i in attention_values_split:
@@ -267,14 +272,22 @@ class UnifiedNMTModel(object):
         with tf.variable_scope("unified_rnn") as unified_rnn_scope:
             unified_rnn_reuse = False
             for step in range(self.steps):
-
-                attention_weighted_source = self.create_attention_network('source', state, unified_rnn_reuse)
-                attention_weighted_target = self.create_attention_network('target', state, unified_rnn_reuse)
-                attention_weighted_context = self.create_attention_network('context', state, unified_rnn_reuse)
+                attention_weighted_source = self.create_attention_network('source', state, unified_rnn_reuse, self.window)
+                attention_weighted_target = self.create_attention_network('target', state, unified_rnn_reuse, self.window) ##### state or output???
+                #attention_weighted_context = self.create_attention_network('context', state, unified_rnn_reuse, self.window)
 
                 unified_rnn_reuse = True
-                cell_input = tf.concat([attention_weighted_source, attention_weighted_target, attention_weighted_context], 1)
+                cell_input = tf.concat(
+                    [attention_weighted_source, attention_weighted_target
+                        #, attention_weighted_context
+                     ], 1)
                 output, state = cell(cell_input, state)
+
+                output gets distributed = (1- w)* target[t-1] + w*output
+
+                WHILE OUTPUTTING, KEEP BUFFER IN THE END FOR GARBAGE
+
+
                 outputs.append(output)
         return (outputs, state)
 
