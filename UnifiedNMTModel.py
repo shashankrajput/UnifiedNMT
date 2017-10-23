@@ -30,6 +30,7 @@ class UnifiedNMTModel(object):
                  attention_activation,
                  residual_connections,
                  projection_activation,
+                 output_projection_activation,
                  dropout,
                  positional_embedding_size,
                  steps,
@@ -76,6 +77,7 @@ class UnifiedNMTModel(object):
         self.attention_activation = attention_activation
         self.residual_connections = residual_connections
         self.projection_activation = projection_activation
+        self.output_projection_activation = output_projection_activation
         self.dropout = dropout
         self.positional_embedding_size = positional_embedding_size
         self.steps = steps
@@ -120,9 +122,7 @@ class UnifiedNMTModel(object):
 
         # Feeds for inputs.
 
-        # Our targets are decoder inputs shifted by one.
-        # targets = [self.decoder_inputs[i + 1]
-        #            for i in range(len(self.decoder_inputs) - 1)]
+
 
 
         self.source_sentences = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_source_sequence_length],
@@ -133,10 +133,7 @@ class UnifiedNMTModel(object):
                                                                             self.num_units,
                                                                             activation_fn=self.projection_activation)
 
-        self.target_sentences_projected = tf.placeholder(tf.int32,
-                                                         shape=[self.batch_size, self.max_target_sequence_length,
-                                                                self.num_units],
-                                                         name="target_sentences")
+        self.target_sentences_projected = tf.zeros([self.batch_size, self.max_sequence_length, self.num_units])
 
         # self.sentence_contexts = tf.placeholder(tf.int32, shape=[self.batch_size, self.max_target_sequence_length,
         #                                                         self.num_units],
@@ -144,6 +141,9 @@ class UnifiedNMTModel(object):
 
         create_static_RNN()
 
+        self.positional_embeddings = tf.get_variable("positional_embeddings",
+                                                     [self.max_sequence_length, self.positional_embedding_size],
+                                                     dtype=dtype)
         # Training outputs and losses.
         if forward_only:
             self.outputs, self.losses = tf.contrib.legacy_seq2seq.model_with_buckets(
@@ -180,6 +180,15 @@ class UnifiedNMTModel(object):
 
         self.saver = tf.train.Saver(tf.global_variables())
 
+    def get_output_words_softmax(self):
+        output_projection_scores = tf.contrib.layers.fully_connected(self.target_sentences_projected,
+                                          self.target_vocab_size,
+                                          activation_fn=self.output_projection_activation)
+
+        USE SAMPLED SOFTMAX!!!
+
+        return tf.nn.softmax(output_projection_scores, dim=-1)
+
     # Creates a single layered cell according to required num_units
     def create_single_layer_cell(self):
         if self.use_lstm:
@@ -203,16 +212,7 @@ class UnifiedNMTModel(object):
             return tf.contrib.rnn.DropoutWrapper(self.create_multi_layered_cell())
         return self.create_multi_layered_cell()
 
-    def create_attention_network(self, network_type, state, network_reuse, window):
-        if network_type == "source":
-            attention_network_input = self.source_sentences_projected
-        elif network_type == "target":
-            attention_network_input = self.target_sentences_projected
-        #elif network_type == "context":
-        #    attention_network_input = self.sentence_contexts
-        else:
-            ######## Add error message
-            return
+    def get_attention_scores(self, attention_network_input, state, network_reuse, window, network_type):
 
         ########## Add residual connections
 
@@ -226,14 +226,10 @@ class UnifiedNMTModel(object):
         for word_index, attention_network_input_i in enumerate(attention_network_input_split):
             fully_connected_reuse = local_reuse or network_reuse
 
-            positional_embeddings = tf.get_variable("positional_embeddings",
-                                                    [self.max_sequence_length, self.positional_embedding_size],
-                                                    dtype=dtype, reuse=fully_connected_reuse)
-
             embedding_lookup_indices = tf.multiply(tf.ones([self.batch_size], dtype=tf.int32, name='current_position'),
                                                    word_index)
 
-            positional_embedding = tf.nn.embedding_lookup(positional_embeddings, embedding_lookup_indices)
+            positional_embedding = tf.nn.embedding_lookup(self.positional_embeddings, embedding_lookup_indices)
 
             attention_scores.append(
                 tf.contrib.layers.stack(tf.concat([attention_network_input_i, state, positional_embedding], 1),
@@ -246,8 +242,24 @@ class UnifiedNMTModel(object):
 
             local_reuse = True
 
-        attention_scores_stacked = tf.stack(attention_scores, axis=1)
-        attention_values = tf.nn.softmax(attention_scores_stacked, dim=1)
+            attention_scores_stacked = tf.stack(attention_scores, axis=1)
+            attention_values = tf.nn.softmax(attention_scores_stacked, dim=1)
+            return attention_values
+
+    def read_attention_network(self, network_type, state, network_reuse, window):
+
+        if network_type == "source_read":
+            attention_network_input = self.source_sentences_projected
+        elif network_type == "target_read":
+            attention_network_input = self.target_sentences_projected
+        # elif network_type == "context":
+        #    attention_network_input = self.sentence_contexts
+        else:
+            ######## Add error message
+            return
+
+        attention_values = self.get_attention_scores(attention_network_input, state, network_reuse, window,
+                                                     network_type)
 
         attention_values_split = tf.split(attention_values, num_or_size_splits=window, axis=-1)
 
@@ -256,6 +268,28 @@ class UnifiedNMTModel(object):
             attention_weighted_inputs.append(tf.reduce_sum(tf.multiply(attention_network_input, attention_values_i), 1))
 
         return tf.stack(attention_weighted_inputs, axis=1)
+
+    def write_attention_network(self, network_type, state, network_reuse, window):
+
+        if network_type == "target_write":
+            attention_network_input = self.target_sentences_projected
+        # elif network_type == "context":
+        #    attention_network_input = self.sentence_contexts
+        else:
+            ######## Add error message
+            return
+
+        attention_values = self.get_attention_scores(attention_network_input, state, network_reuse, window,
+                                                     network_type)
+
+        attention_values_split = tf.split(attention_values, num_or_size_splits=window, axis=-1)
+
+        state_stacked = tf.stack([state] * self.max_sequence_length, axis = 1)
+
+        attention_weighted_inputs = []
+        for attention_values_i in attention_values_split:
+            if network_type == "target_write":
+                self.target_sentences_projected = tf.multiply(attention_network_input, 1 - attention_values_i) + tf.multiply(state_stacked, attention_values_i)
 
     ##################### tf.contrib.rnn.LSTMBlockWrapper
     ##################### Input and Output projection wrappers
@@ -269,51 +303,77 @@ class UnifiedNMTModel(object):
         outputs = []
 
         ######### Will this handle batches?
-        with tf.variable_scope("unified_rnn") as unified_rnn_scope:
-            unified_rnn_reuse = False
-            for step in range(self.steps):
-                attention_weighted_source = self.create_attention_network('source', state, unified_rnn_reuse, self.window)
-                attention_weighted_target = self.create_attention_network('target', state, unified_rnn_reuse, self.window) ##### state or output???
-                #attention_weighted_context = self.create_attention_network('context', state, unified_rnn_reuse, self.window)
 
-                unified_rnn_reuse = True
-                cell_input = tf.concat(
-                    [attention_weighted_source, attention_weighted_target
-                        #, attention_weighted_context
-                     ], 1)
-                output, state = cell(cell_input, state)
+        unified_rnn_reuse = False
+        for step in range(self.steps):
+            attention_weighted_source = self.read_attention_network('source_read', state, unified_rnn_reuse, self.window)
+            attention_weighted_target = self.read_attention_network('target_read', state, unified_rnn_reuse,
+                                                                      self.window)  ##### state or output???
+            # attention_weighted_context = self.create_attention_network('context', state, unified_rnn_reuse, self.window)
 
-                output gets distributed = (1- w)* target[t-1] + w*output
+            unified_rnn_reuse = True
+            cell_input = tf.concat(
+                [attention_weighted_source, attention_weighted_target
+                 # , attention_weighted_context
+                 ], 1)
+            output, state = cell(cell_input, state)
 
-                WHILE OUTPUTTING, KEEP BUFFER IN THE END FOR GARBAGE
-
-
-                outputs.append(output)
-        return (outputs, state)
-
-    ####################OVERRIDE GRUCELL TO PUT ATTENTION INSIDE?
+            self.write_attention_network('target_write', output, unified_rnn_reuse, self.window)
 
 
-    # The seq2seq function: we use embedding for the input and attention.
-    def seq2seq_f(self):
-        with tf.variable_scope.variable_scope("unified_embedding_attention_seq2seq", dtype=self.dtype) as scope:
-            cell = self.create_static_RNN()
-            dtype = scope.dtype
+            # WHILE
+            # OUTPUTTING, KEEP
+            # BUFFER
+            # IN
+            # THE
+            # END
+            # FOR
+            # GARBAGE
 
-            # First calculate a concatenation of encoder outputs to put attention on.
-            top_states = [
-                array_ops.reshape(e, [-1, 1, cell.output_size]) for e in encoder_outputs
-            ]
-            attention_states = array_ops.concat(top_states, 1)
 
-            # Decoder.
-            output_size = None
-            if output_projection is None:
-                cell = core_rnn_cell.OutputProjectionWrapper(cell, num_decoder_symbols)
-                output_size = num_decoder_symbols
 
-            if isinstance(feed_previous, bool):
-                return embedding_attention_decoder(
+
+####################OVERRIDE GRUCELL TO PUT ATTENTION INSIDE?
+
+
+# The seq2seq function: we use embedding for the input and attention.
+def seq2seq_f(self):
+    with tf.variable_scope.variable_scope("unified_embedding_attention_seq2seq", dtype=self.dtype) as scope:
+        cell = self.create_static_RNN()
+        dtype = scope.dtype
+
+        # First calculate a concatenation of encoder outputs to put attention on.
+        top_states = [
+            array_ops.reshape(e, [-1, 1, cell.output_size]) for e in encoder_outputs
+        ]
+        attention_states = array_ops.concat(top_states, 1)
+
+        # Decoder.
+        output_size = None
+        if output_projection is None:
+            cell = core_rnn_cell.OutputProjectionWrapper(cell, num_decoder_symbols)
+            output_size = num_decoder_symbols
+
+        if isinstance(feed_previous, bool):
+            return embedding_attention_decoder(
+                decoder_inputs,
+                encoder_state,
+                attention_states,
+                cell,
+                num_decoder_symbols,
+                embedding_size,
+                num_heads=num_heads,
+                output_size=output_size,
+                output_projection=output_projection,
+                feed_previous=feed_previous,
+                initial_state_attention=initial_state_attention)
+
+        # If feed_previous is a Tensor, we construct 2 graphs and use cond.
+        def decoder(feed_previous_bool):
+            reuse = None if feed_previous_bool else True
+            with variable_scope.variable_scope(
+                    variable_scope.get_variable_scope(), reuse=reuse):
+                outputs, state = embedding_attention_decoder(
                     decoder_inputs,
                     encoder_state,
                     attention_states,
@@ -323,159 +383,143 @@ class UnifiedNMTModel(object):
                     num_heads=num_heads,
                     output_size=output_size,
                     output_projection=output_projection,
-                    feed_previous=feed_previous,
+                    feed_previous=feed_previous_bool,
+                    update_embedding_for_previous=False,
                     initial_state_attention=initial_state_attention)
+                state_list = [state]
+                if nest.is_sequence(state):
+                    state_list = nest.flatten(state)
+                return outputs + state_list
 
-            # If feed_previous is a Tensor, we construct 2 graphs and use cond.
-            def decoder(feed_previous_bool):
-                reuse = None if feed_previous_bool else True
-                with variable_scope.variable_scope(
-                        variable_scope.get_variable_scope(), reuse=reuse):
-                    outputs, state = embedding_attention_decoder(
-                        decoder_inputs,
-                        encoder_state,
-                        attention_states,
-                        cell,
-                        num_decoder_symbols,
-                        embedding_size,
-                        num_heads=num_heads,
-                        output_size=output_size,
-                        output_projection=output_projection,
-                        feed_previous=feed_previous_bool,
-                        update_embedding_for_previous=False,
-                        initial_state_attention=initial_state_attention)
-                    state_list = [state]
-                    if nest.is_sequence(state):
-                        state_list = nest.flatten(state)
-                    return outputs + state_list
+        outputs_and_state = control_flow_ops.cond(feed_previous,
+                                                  lambda: decoder(True),
+                                                  lambda: decoder(False))
+        outputs_len = len(decoder_inputs)  # Outputs length same as decoder inputs.
+        state_list = outputs_and_state[outputs_len:]
+        state = state_list[0]
+        if nest.is_sequence(encoder_state):
+            state = nest.pack_sequence_as(
+                structure=encoder_state, flat_sequence=state_list)
+        return outputs_and_state[:outputs_len], state
 
-            outputs_and_state = control_flow_ops.cond(feed_previous,
-                                                      lambda: decoder(True),
-                                                      lambda: decoder(False))
-            outputs_len = len(decoder_inputs)  # Outputs length same as decoder inputs.
-            state_list = outputs_and_state[outputs_len:]
-            state = state_list[0]
-            if nest.is_sequence(encoder_state):
-                state = nest.pack_sequence_as(
-                    structure=encoder_state, flat_sequence=state_list)
-            return outputs_and_state[:outputs_len], state
 
-    def step(self, session, encoder_inputs, decoder_inputs, target_weights,
-             bucket_id, forward_only):
-        """Run a step of the model feeding the given inputs.
+def step(self, session, encoder_inputs, decoder_inputs, target_weights,
+         bucket_id, forward_only):
+    """Run a step of the model feeding the given inputs.
 
-        Args:
-          session: tensorflow session to use.
-          encoder_inputs: list of numpy int vectors to feed as encoder inputs.
-          decoder_inputs: list of numpy int vectors to feed as decoder inputs.
-          target_weights: list of numpy float vectors to feed as target weights.
-          bucket_id: which bucket of the model to use.
-          forward_only: whether to do the backward step or only forward.
+    Args:
+      session: tensorflow session to use.
+      encoder_inputs: list of numpy int vectors to feed as encoder inputs.
+      decoder_inputs: list of numpy int vectors to feed as decoder inputs.
+      target_weights: list of numpy float vectors to feed as target weights.
+      bucket_id: which bucket of the model to use.
+      forward_only: whether to do the backward step or only forward.
 
-        Returns:
-          A triple consisting of gradient norm (or None if we did not do backward),
-          average perplexity, and the outputs.
+    Returns:
+      A triple consisting of gradient norm (or None if we did not do backward),
+      average perplexity, and the outputs.
 
-        Raises:
-          ValueError: if length of encoder_inputs, decoder_inputs, or
-            target_weights disagrees with bucket size for the specified bucket_id.
-        """
-        # Check if the sizes match.
-        encoder_size, decoder_size = self.buckets[bucket_id]
-        if len(encoder_inputs) != encoder_size:
-            raise ValueError("Encoder length must be equal to the one in bucket,"
-                             " %d != %d." % (len(encoder_inputs), encoder_size))
-        if len(decoder_inputs) != decoder_size:
-            raise ValueError("Decoder length must be equal to the one in bucket,"
-                             " %d != %d." % (len(decoder_inputs), decoder_size))
-        if len(target_weights) != decoder_size:
-            raise ValueError("Weights length must be equal to the one in bucket,"
-                             " %d != %d." % (len(target_weights), decoder_size))
+    Raises:
+      ValueError: if length of encoder_inputs, decoder_inputs, or
+        target_weights disagrees with bucket size for the specified bucket_id.
+    """
+    # Check if the sizes match.
+    encoder_size, decoder_size = self.buckets[bucket_id]
+    if len(encoder_inputs) != encoder_size:
+        raise ValueError("Encoder length must be equal to the one in bucket,"
+                         " %d != %d." % (len(encoder_inputs), encoder_size))
+    if len(decoder_inputs) != decoder_size:
+        raise ValueError("Decoder length must be equal to the one in bucket,"
+                         " %d != %d." % (len(decoder_inputs), decoder_size))
+    if len(target_weights) != decoder_size:
+        raise ValueError("Weights length must be equal to the one in bucket,"
+                         " %d != %d." % (len(target_weights), decoder_size))
 
-        # Input feed: encoder inputs, decoder inputs, target_weights, as provided.
-        input_feed = {}
-        for l in xrange(encoder_size):
-            input_feed[self.encoder_inputs[l].name] = encoder_inputs[l]
-        for l in xrange(decoder_size):
-            input_feed[self.decoder_inputs[l].name] = decoder_inputs[l]
-            input_feed[self.target_weights[l].name] = target_weights[l]
+    # Input feed: encoder inputs, decoder inputs, target_weights, as provided.
+    input_feed = {}
+    for l in xrange(encoder_size):
+        input_feed[self.encoder_inputs[l].name] = encoder_inputs[l]
+    for l in xrange(decoder_size):
+        input_feed[self.decoder_inputs[l].name] = decoder_inputs[l]
+        input_feed[self.target_weights[l].name] = target_weights[l]
 
-        # Since our targets are decoder inputs shifted by one, we need one more.
-        last_target = self.decoder_inputs[decoder_size].name
-        input_feed[last_target] = np.zeros([self.batch_size], dtype=np.int32)
+    # Since our targets are decoder inputs shifted by one, we need one more.
+    last_target = self.decoder_inputs[decoder_size].name
+    input_feed[last_target] = np.zeros([self.batch_size], dtype=np.int32)
 
-        # Output feed: depends on whether we do a backward step or not.
-        if not forward_only:
-            output_feed = [self.updates[bucket_id],  # Update Op that does SGD.
-                           self.gradient_norms[bucket_id],  # Gradient norm.
-                           self.losses[bucket_id]]  # Loss for this batch.
-        else:
-            output_feed = [self.losses[bucket_id]]  # Loss for this batch.
-            for l in xrange(decoder_size):  # Output logits.
-                output_feed.append(self.outputs[bucket_id][l])
+    # Output feed: depends on whether we do a backward step or not.
+    if not forward_only:
+        output_feed = [self.updates[bucket_id],  # Update Op that does SGD.
+                       self.gradient_norms[bucket_id],  # Gradient norm.
+                       self.losses[bucket_id]]  # Loss for this batch.
+    else:
+        output_feed = [self.losses[bucket_id]]  # Loss for this batch.
+        for l in xrange(decoder_size):  # Output logits.
+            output_feed.append(self.outputs[bucket_id][l])
 
-        outputs = session.run(output_feed, input_feed)
-        if not forward_only:
-            return outputs[1], outputs[2], None  # Gradient norm, loss, no outputs.
-        else:
-            return None, outputs[0], outputs[1:]  # No gradient norm, loss, outputs.
+    outputs = session.run(output_feed, input_feed)
+    if not forward_only:
+        return outputs[1], outputs[2], None  # Gradient norm, loss, no outputs.
+    else:
+        return None, outputs[0], outputs[1:]  # No gradient norm, loss, outputs.
 
-    def get_batch(self, data, bucket_id):
-        """Get a random batch of data from the specified bucket, prepare for step.
 
-        To feed data in step(..) it must be a list of batch-major vectors, while
-        data here contains single length-major cases. So the main logic of this
-        function is to re-index data cases to be in the proper format for feeding.
+def get_batch(self, data, bucket_id):
+    """Get a random batch of data from the specified bucket, prepare for step.
 
-        Args:
-          data: a tuple of size len(self.buckets) in which each element contains
-            lists of pairs of input and output data that we use to create a batch.
-          bucket_id: integer, which bucket to get the batch for.
+    To feed data in step(..) it must be a list of batch-major vectors, while
+    data here contains single length-major cases. So the main logic of this
+    function is to re-index data cases to be in the proper format for feeding.
 
-        Returns:
-          The triple (encoder_inputs, decoder_inputs, target_weights) for
-          the constructed batch that has the proper format to call step(...) later.
-        """
-        encoder_size, decoder_size = self.buckets[bucket_id]
-        encoder_inputs, decoder_inputs = [], []
+    Args:
+      data: a tuple of size len(self.buckets) in which each element contains
+        lists of pairs of input and output data that we use to create a batch.
+      bucket_id: integer, which bucket to get the batch for.
 
-        # Get a random batch of encoder and decoder inputs from data,
-        # pad them if needed, reverse encoder inputs and add GO to decoder.
-        for _ in xrange(self.batch_size):
-            encoder_input, decoder_input = random.choice(data[bucket_id])
+    Returns:
+      The triple (encoder_inputs, decoder_inputs, target_weights) for
+      the constructed batch that has the proper format to call step(...) later.
+    """
+    encoder_size, decoder_size = self.buckets[bucket_id]
+    encoder_inputs, decoder_inputs = [], []
 
-            # Encoder inputs are padded and then reversed.
-            encoder_pad = [data_utils.PAD_ID] * (encoder_size - len(encoder_input))
-            encoder_inputs.append(list(reversed(encoder_input + encoder_pad)))
+    # Get a random batch of encoder and decoder inputs from data,
+    # pad them if needed, reverse encoder inputs and add GO to decoder.
+    for _ in xrange(self.batch_size):
+        encoder_input, decoder_input = random.choice(data[bucket_id])
 
-            # Decoder inputs get an extra "GO" symbol, and are padded then.
-            decoder_pad_size = decoder_size - len(decoder_input) - 1
-            decoder_inputs.append([data_utils.GO_ID] + decoder_input +
-                                  [data_utils.PAD_ID] * decoder_pad_size)
+        # Encoder inputs are padded and then reversed.
+        encoder_pad = [data_utils.PAD_ID] * (encoder_size - len(encoder_input))
+        encoder_inputs.append(list(reversed(encoder_input + encoder_pad)))
 
-        # Now we create batch-major vectors from the data selected above.
-        batch_encoder_inputs, batch_decoder_inputs, batch_weights = [], [], []
+        # Decoder inputs get an extra "GO" symbol, and are padded then.
+        decoder_pad_size = decoder_size - len(decoder_input) - 1
+        decoder_inputs.append([data_utils.GO_ID] + decoder_input +
+                              [data_utils.PAD_ID] * decoder_pad_size)
 
-        # Batch encoder inputs are just re-indexed encoder_inputs.
-        for length_idx in xrange(encoder_size):
-            batch_encoder_inputs.append(
-                np.array([encoder_inputs[batch_idx][length_idx]
-                          for batch_idx in xrange(self.batch_size)], dtype=np.int32))
+    # Now we create batch-major vectors from the data selected above.
+    batch_encoder_inputs, batch_decoder_inputs, batch_weights = [], [], []
 
-        # Batch decoder inputs are re-indexed decoder_inputs, we create weights.
-        for length_idx in xrange(decoder_size):
-            batch_decoder_inputs.append(
-                np.array([decoder_inputs[batch_idx][length_idx]
-                          for batch_idx in xrange(self.batch_size)], dtype=np.int32))
+    # Batch encoder inputs are just re-indexed encoder_inputs.
+    for length_idx in xrange(encoder_size):
+        batch_encoder_inputs.append(
+            np.array([encoder_inputs[batch_idx][length_idx]
+                      for batch_idx in xrange(self.batch_size)], dtype=np.int32))
 
-            # Create target_weights to be 0 for targets that are padding.
-            batch_weight = np.ones(self.batch_size, dtype=np.float32)
-            for batch_idx in xrange(self.batch_size):
-                # We set weight to 0 if the corresponding target is a PAD symbol.
-                # The corresponding target is decoder_input shifted by 1 forward.
-                if length_idx < decoder_size - 1:
-                    target = decoder_inputs[batch_idx][length_idx + 1]
-                if length_idx == decoder_size - 1 or target == data_utils.PAD_ID:
-                    batch_weight[batch_idx] = 0.0
-            batch_weights.append(batch_weight)
-        return batch_encoder_inputs, batch_decoder_inputs, batch_weights
+    # Batch decoder inputs are re-indexed decoder_inputs, we create weights.
+    for length_idx in xrange(decoder_size):
+        batch_decoder_inputs.append(
+            np.array([decoder_inputs[batch_idx][length_idx]
+                      for batch_idx in xrange(self.batch_size)], dtype=np.int32))
+
+        # Create target_weights to be 0 for targets that are padding.
+        batch_weight = np.ones(self.batch_size, dtype=np.float32)
+        for batch_idx in xrange(self.batch_size):
+            # We set weight to 0 if the corresponding target is a PAD symbol.
+            # The corresponding target is decoder_input shifted by 1 forward.
+            if length_idx < decoder_size - 1:
+                target = decoder_inputs[batch_idx][length_idx + 1]
+            if length_idx == decoder_size - 1 or target == data_utils.PAD_ID:
+                batch_weight[batch_idx] = 0.0
+        batch_weights.append(batch_weight)
+    return batch_encoder_inputs, batch_decoder_inputs, batch_weights
